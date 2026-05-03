@@ -2,6 +2,7 @@
 #include <ATen/native/mkldnn/xpu/detail/Attr.h>
 #include <ATen/native/mkldnn/xpu/detail/Utils.h>
 #include <ATen/native/mkldnn/xpu/detail/oneDNN.h>
+#include <ATen/xpu/XPUGraphsUtils.h>
 #include <oneapi/dnnl/dnnl.hpp>
 
 namespace {
@@ -21,6 +22,29 @@ inline data_type to_logical_tensor_data_type(c10::ScalarType scalar_type) {
       : scalar_type == c10::ScalarType::Half     ? data_type::f16
       : scalar_type == c10::ScalarType::BFloat16 ? data_type::bf16
                                                  : data_type::undef;
+}
+
+// Helper to construct a logical tensor for scalar inputs (scale/neg_inf).
+// In graph capture mode, uses device tensor representation (dims{1}).
+// Otherwise, uses oneDNN's host scalar.
+template <typename TensorID>
+inline logical_tensor make_scalar_logical_tensor(
+    TensorID id,
+    bool is_capturing) {
+  if (is_capturing) {
+    return {
+        static_cast<size_t>(id),
+        logical_tensor::data_type::f32,
+        dims{1},
+        logical_tensor::layout_type::strided};
+  } else {
+    return {
+        static_cast<size_t>(id),
+        logical_tensor::data_type::f32,
+        0,
+        logical_tensor::layout_type::strided,
+        logical_tensor::property_type::host_scalar};
+  }
 }
 
 namespace sdpa_forward {
@@ -62,7 +86,8 @@ struct SDPALogicalParams {
       int head_dim_qk,
       int head_dim_v,
       bool is_causal,
-      bool compute_logsumexp) {
+      bool compute_logsumexp,
+      bool is_capturing = false) {
     const data_type dtype = to_logical_tensor_data_type(query_.scalar_type());
     TORCH_INTERNAL_ASSERT(
         (dtype != data_type::undef),
@@ -122,19 +147,9 @@ struct SDPALogicalParams {
 
     LOGIC_TENSOR_DESC(query, dtype);
     LOGIC_TENSOR_DESC(key, dtype);
-    scale = {
-        static_cast<size_t>(TensorID::scale),
-        logical_tensor::data_type::f32,
-        0,
-        logical_tensor::layout_type::strided,
-        logical_tensor::property_type::host_scalar};
+    scale = make_scalar_logical_tensor(TensorID::scale, is_capturing);
     if (is_causal) {
-      neg_inf = {
-          static_cast<size_t>(TensorID::neg_inf),
-          logical_tensor::data_type::f32,
-          0,
-          logical_tensor::layout_type::strided,
-          logical_tensor::property_type::host_scalar};
+      neg_inf = make_scalar_logical_tensor(TensorID::neg_inf, is_capturing);
     }
     if (attn_mask_.has_value()) {
       const data_type mask_dtype =
@@ -320,7 +335,8 @@ partition create_sdpa_graph_partition(
 partition& find_or_create_graph_partition(
     bool is_causal,
     bool compute_logsumexp,
-    const SDPALogicalParams& params) {
+    const SDPALogicalParams& params,
+    bool is_capturing = false) {
   thread_local PartitionCache cache;
   const data_type dtype = params.query.get_data_type();
 
@@ -343,6 +359,7 @@ partition& find_or_create_graph_partition(
   patternID.set(pos++, is_causal);
   // compute_logsumexp
   patternID.set(pos++, compute_logsumexp);
+  patternID.set(pos++, is_capturing);
 
   auto partition_ = cache.find_partition(patternID);
   if (!partition_.has_value()) {
@@ -406,7 +423,8 @@ struct SDPABackwardLogicalParams {
       int seq_len_kv,
       int head_dim_qk,
       int head_dim_v,
-      bool is_causal) {
+      bool is_causal,
+      bool is_capturing = false) {
     const data_type dtype = to_logical_tensor_data_type(query_.scalar_type());
     TORCH_INTERNAL_ASSERT(
         (dtype != data_type::undef),
@@ -475,19 +493,9 @@ struct SDPABackwardLogicalParams {
     LOGIC_TENSOR_DESC(value, dtype);
     LOGIC_TENSOR_DESC(out, dtype);
     LOGIC_TENSOR_DESC(logsumexp, sdpa_intermediate_dtype);
-    scale = {
-        static_cast<size_t>(TensorID::scale),
-        logical_tensor::data_type::f32,
-        0,
-        logical_tensor::layout_type::strided,
-        logical_tensor::property_type::host_scalar};
+    scale = make_scalar_logical_tensor(TensorID::scale, is_capturing);
     if (is_causal) {
-      neg_inf = {
-          static_cast<size_t>(TensorID::neg_inf),
-          logical_tensor::data_type::f32,
-          0,
-          logical_tensor::layout_type::strided,
-          logical_tensor::property_type::host_scalar};
+      neg_inf = make_scalar_logical_tensor(TensorID::neg_inf, is_capturing);
     }
     if (attn_mask_.has_value()) {
       const data_type mask_dtype =
@@ -742,7 +750,8 @@ partition create_sdpa_backward_graph_partition(
 
 partition& find_or_create_backward_graph_partition(
     bool is_causal,
-    const SDPABackwardLogicalParams& params) {
+    const SDPABackwardLogicalParams& params,
+    bool is_capturing = false) {
   thread_local PartitionCache cache;
   const data_type dtype = params.query.get_data_type();
 
@@ -764,6 +773,7 @@ partition& find_or_create_backward_graph_partition(
   // attn_mask
   patternID.set(pos++, params.attn_mask.has_value());
   patternID.set(pos++, is_causal);
+  patternID.set(pos++, is_capturing);
 
   auto partition_ = cache.find_partition(patternID);
   if (!partition_.has_value()) {
@@ -777,6 +787,37 @@ partition& find_or_create_backward_graph_partition(
   return *partition_;
 }
 } // namespace sdpa_backward
+
+// Helper to add scalar tensor input with proper lifetime management.
+// During graph capture, creates a device tensor to avoid embedding host
+// addresses in the graph that leave scope. Otherwise, uses oneDNN's host
+// scalar.
+inline void add_scalar_tensor_input(
+    std::vector<dnnl::graph::tensor>& inputs,
+    const std::vector<dnnl::graph::logical_tensor>& l_inputs,
+    size_t& input_index,
+    float scalar_value,
+    const at::Tensor& reference_tensor,
+    dnnl::engine& engine,
+    bool is_capturing,
+    at::Tensor& tensor) {
+  if (is_capturing) {
+    tensor = at::full(
+        {1},
+        scalar_value,
+        reference_tensor.options().dtype(at::kFloat));
+    inputs.emplace_back(
+        l_inputs[input_index++],
+        engine,
+        tensor.data_ptr());
+  } else {
+    inputs.emplace_back(
+        dnnl::graph::tensor::make_scalar_tensor(
+            l_inputs[input_index++],
+            const_cast<float*>(&scalar_value)));
+  }
+}
+
 } // namespace
 
 namespace at::native::onednn {
@@ -799,6 +840,8 @@ void sdpa(
     const Tensor& logsumexp) {
   auto& eng = GpuEngineManager::Instance().get_engine();
   auto& strm = GpuStreamManager::Instance().get_stream();
+  const bool is_capturing = at::xpu::currentStreamCaptureStatus() ==
+      c10::xpu::CaptureStatus::Recording;
 
   const auto get_tril_mask = [&]() {
     auto opts = query.options();
@@ -837,9 +880,10 @@ void sdpa(
       head_dim_qk,
       head_dim_v,
       is_causal,
-      compute_logsumexp);
+      compute_logsumexp,
+      is_capturing);
   auto& partition = sdpa_forward::find_or_create_graph_partition(
-      is_causal, compute_logsumexp, logical_params);
+      is_causal, compute_logsumexp, logical_params, is_capturing);
   l_inputs = std::move(logical_params.get_input());
   l_outputs = std::move(logical_params.get_output());
   compiled_partition = partition.compile(l_inputs, l_outputs, eng);
@@ -855,17 +899,20 @@ void sdpa(
   std::vector<dnnl::graph::tensor> inputs;
   inputs.reserve(l_inputs.size());
 
+  at::Tensor scale_tensor, neg_inf_tensor;
+
 #define ADD_INPUT(variable) \
   inputs.emplace_back(l_inputs[i++], eng, variable.data_ptr())
 
   ADD_INPUT(query);
   ADD_INPUT(key);
-  inputs.emplace_back(
-      dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++], &softmax_scale));
+  add_scalar_tensor_input(
+      inputs, l_inputs, i, softmax_scale, query, eng, is_capturing, scale_tensor);
   if (is_causal) {
-    constexpr float neg_inf_val = -std::numeric_limits<float>::infinity();
-    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
-        l_inputs[i++], const_cast<float*>(&neg_inf_val)));
+    add_scalar_tensor_input(
+        inputs, l_inputs, i,
+        -std::numeric_limits<float>::infinity(),
+        query, eng, is_capturing, neg_inf_tensor);
   }
   if (attn_mask.has_value()) {
     ADD_INPUT((*attn_mask));
@@ -898,6 +945,8 @@ void sdpa_backward(
     Tensor& grad_value) {
   auto& eng = GpuEngineManager::Instance().get_engine();
   auto& strm = GpuStreamManager::Instance().get_stream();
+  const bool is_capturing = at::xpu::currentStreamCaptureStatus() ==
+      c10::xpu::CaptureStatus::Recording;
 
   const auto get_tril_mask = [&]() {
     auto opts = query.options();
@@ -939,9 +988,10 @@ void sdpa_backward(
       seq_len_kv,
       head_dim_qk,
       head_dim_v,
-      is_causal);
+      is_causal,
+      is_capturing);
   auto& partition = sdpa_backward::find_or_create_backward_graph_partition(
-      is_causal, logical_params);
+      is_causal, logical_params, is_capturing);
   l_inputs = std::move(logical_params.get_input());
   l_outputs = std::move(logical_params.get_output());
   compiled_partition = partition.compile(l_inputs, l_outputs, eng);
@@ -956,6 +1006,8 @@ void sdpa_backward(
   std::vector<dnnl::graph::tensor> inputs;
   inputs.reserve(l_inputs.size());
 
+  at::Tensor scale_tensor, neg_inf_tensor;
+
 #define ADD_INPUT(variable) \
   inputs.emplace_back(l_inputs[i++], eng, variable.data_ptr())
 
@@ -965,12 +1017,13 @@ void sdpa_backward(
   ADD_INPUT(value);
   ADD_INPUT(out);
   ADD_INPUT(logsumexp);
-  inputs.emplace_back(
-      dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++], &softmax_scale));
+  add_scalar_tensor_input(
+      inputs, l_inputs, i, softmax_scale, query, eng, is_capturing, scale_tensor);
   if (is_causal) {
-    constexpr float neg_inf_val = -std::numeric_limits<float>::infinity();
-    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
-        l_inputs[i++], const_cast<float*>(&neg_inf_val)));
+    add_scalar_tensor_input(
+        inputs, l_inputs, i,
+        -std::numeric_limits<float>::infinity(),
+        query, eng, is_capturing, neg_inf_tensor);
   }
   if (attn_mask.has_value()) {
     ADD_INPUT((*attn_mask));
